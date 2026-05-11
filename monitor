@@ -1,0 +1,120 @@
+import requests
+from bs4 import BeautifulSoup
+import json
+import os
+import re
+from concurrent.futures import ThreadPoolExecutor
+import urllib.parse  # 新增：专门用来处理网址特殊字符的工具！
+
+# --- 配置区 ---
+LOGIN_URL = 'https://harts.systems/webtess/login'
+GRADES_URL = 'https://harts.systems/webtess/parent.jsp'
+DETAIL_API_URL = 'https://harts.systems/webtess/gradebook'
+DATA_FILE = 'grades_history.json'
+
+# 注意：这里换成你的 Bark 链接（请确保链接最后带有一个斜杠 /）
+BARK_URL = 'https://api.day.app/你的key/'
+
+PAYLOAD = {
+    'username': '你的账号',
+    'password': '你的密码',
+    'mobileBrowser': '0',
+    'browserWidth': '0',
+    'savebutton': 'Click to sign in'
+}
+
+def fetch_single_course(session, headers, btn):
+    match = re.search(r"getGradebookByStudent\('([^']+)'\)", btn['onclick'])
+    if not match: return None
+    
+    params_str = match.group(1)
+    stid, masid, crsid, crsnum = params_str.split(',')
+    
+    row = btn.find_parent('tr')
+    tds = row.find_all('td')
+    course_name = tds[1].get_text(strip=True) if len(tds) > 1 else f"课程{crsnum}"
+    
+    api_params = {
+        'mode': 'get_published_marks_by_student',
+        'stid': stid, 'masid': masid, 'crsid': crsid, 'crsnum': crsnum
+    }
+    
+    try:
+        res = session.post(DETAIL_API_URL, params=api_params, headers=headers, timeout=10)
+        score_match = re.search(r'<stavg>.*?([\d\.]+)\s*</stavg>', res.text)
+        score = score_match.group(1) if score_match else "无具体分数"
+        return course_name, score
+    except:
+        return course_name, "查询失败"
+
+def get_realtime_grades():
+    session = requests.Session()
+    headers = {'User-Agent': 'Mozilla/5.0 (iPad; CPU OS 16_0 like Mac OS X) AppleWebKit/605.1.15'}
+    
+    print("🚀 正在极速登录并获取密钥...")
+    session.post(LOGIN_URL, data=PAYLOAD, headers=headers)
+    res = session.get(GRADES_URL, headers=headers)
+    soup = BeautifulSoup(res.text, 'html.parser')
+    
+    buttons = soup.find_all('input', onclick=re.compile(r"getGradebookByStudent\('([^']+)'\)"))
+    
+    current_grades = {}
+    print(f"检测到 {len(buttons)} 门课，启动多线程并行抓取...")
+    
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        results = list(executor.map(lambda b: fetch_single_course(session, headers, b), buttons))
+    
+    for res in results:
+        if res:
+            name, score = res
+            current_grades[name] = score
+            print(f"✅ {name}: {score}")
+            
+    return current_grades
+
+def main():
+    print("=== 开始极速实时监控 ===")
+    new_grades = get_realtime_grades()
+    if not new_grades: return
+
+    old_grades = {}
+    if os.path.exists(DATA_FILE):
+        with open(DATA_FILE, 'r', encoding='utf-8') as f:
+            old_grades = json.load(f)
+
+    updates = []
+    for course, score in new_grades.items():
+        if score in ["无具体分数", "查询失败"]: continue
+        if course not in old_grades:
+            updates.append(f"🆕 新增: {course} -> {score}")
+        elif old_grades[course] != score:
+            updates.append(f"🚨 更新: {course} [{old_grades[course]} -> {score}]")
+
+    if updates:
+        msg = "\n".join(updates)
+        print(f"\n🎉 发现分数变化！\n{msg}")
+        
+        # --- 完美的 Bark 推送代码 ---
+        if 'BARK_URL' in globals() and BARK_URL:
+            try:
+                # 设定弹窗的标题
+                title = "成绩更新啦！"
+                # 把特殊字符（回车、空格等）转换成网址安全格式
+                safe_title = urllib.parse.quote(title)
+                safe_msg = urllib.parse.quote(msg)
+                
+                # 组合最终的安全链接并发送
+                final_url = f"{BARK_URL}{safe_title}/{safe_msg}"
+                requests.get(final_url)
+                print("📱 已成功发送 Bark 手机弹窗通知！")
+            except Exception as e:
+                print(f"⚠️ Bark 发送失败: {e}")
+        # -----------------------------
+    else:
+        print("\n✅ 检查完毕：暂无变化。")
+        
+    with open(DATA_FILE, 'w', encoding='utf-8') as f:
+        json.dump(new_grades, f, ensure_ascii=False, indent=4)
+
+if __name__ == "__main__":
+    main()
